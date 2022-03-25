@@ -1,0 +1,368 @@
+import re
+import os
+import time
+import torch
+import random
+import pickle
+import numpy as np
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from gensim.models import LdaModel
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+class ETM(nn.Module):
+    '''Topic Modeling in Embedding Spaces
+
+    INTERFACE
+    ---------
+    self.__init__
+      V [int] # of words
+      H [int] # of hidden layer dimensions
+      T [int] # of topics
+      E [int] # of embedding layer dimensions
+      args [dict] activation function, dropout rate
+
+    self.encode
+      bows [torch.tensor] bag of words: # of docs * V
+
+    self.forward
+      bows [torch.tensor] bag of words: # of docs * V
+      normalized [bool] normalize bows if true
+
+    self.get_topics => top k words for each topic [numpy.array]
+      w2v [script.etm.Word2Vec] Word2Vec model
+      k [int] top k words chosen from each topic to represent the topic
+      output [bool] return the top k words if true
+
+    self.alphas => topic embeddings
+
+    REFERENCE
+    ---------
+    Topic Modeling in Embedding Spaces [Dieng et al. 2019]
+    Auto-Encoding Variational Bayes [Kingma and Welling 2013] (KW2013)
+    An Introduction to Variational Autoencoders  [Kingma and Welling 2019] (KW2019)
+    '''
+    def __init__(self, V, H, T, E, activation, dropout_rate, 
+                 pretrained_weight=None, rho_grad=True):
+        super(ETM, self).__init__()
+        # input => hidden state
+        self._q_theta = nn.Sequential(
+            nn.Linear(V, H),
+            nn.Dropout(dropout_rate),
+            get_activation(activation),
+            nn.Linear(H, H),
+            nn.Dropout(dropout_rate),
+            get_activation(activation)
+        )
+        for l in self._q_theta:
+            if type(l) == nn.Linear:
+                nn.init.kaiming_normal_(l.weight, nonlinearity=activation)
+                l.bias.data.fill_(0)
+
+        # hidden state => mu, log(sigma^2)
+        self._mu_q_theta = nn.Linear(H, T, bias=True)
+        self._mu_q_theta.bias.data.fill_(0)
+        nn.init.kaiming_normal_(self._mu_q_theta.weight, nonlinearity=activation)
+
+        self._log_sigma2_q_theta = nn.Linear(H, T, bias=True)
+        self._log_sigma2_q_theta.bias.data.fill_(0)
+        nn.init.kaiming_normal_(self._log_sigma2_q_theta.weight, nonlinearity=activation)
+
+        # rho & alpha(s)
+        self._rho = nn.Linear(E, V, bias=False) # shape of weight matrix: V * E
+        if pretrained_weight is not None:
+            v, e = pretrained_weight.shape
+            assert (v, e) == (V, E), f'pre-trained weight: expect ({V}, {E}) but get ({v}, {e}).'
+            self._rho.weight = nn.Parameter(pretrained_weight)
+            self._rho.weight.requires_grad = rho_grad
+        else:
+            nn.init.xavier_normal_(self._rho.weight)
+            if not rho_grad:
+                print("No pre-trained weights, rho_grad is set to True")
+        self._alphas = nn.Linear(E, T, bias=False)
+        nn.init.orthogonal_(self._alphas.weight)
+
+    def _reparameterize(self, mu, log_sigma2):
+        # KW2013: Section 2.4
+        if self.training:
+            sigma = torch.exp(0.5 * log_sigma2) 
+            epsilon = torch.randn_like(sigma)
+            return mu + sigma * epsilon
+        else:
+            return mu
+
+    def encode(self, bows):
+        # KW2019
+        # input => hidden state
+        q_theta = self._q_theta(bows)
+        # hidden state => mu, log(sigma^2)
+        mu_theta = self._mu_q_theta(q_theta)
+        log_sigma2_theta = self._log_sigma2_q_theta(q_theta)
+        # KW2013: Section 3 & Appendix B
+        kld_theta = -0.5 * torch.sum(1+log_sigma2_theta-mu_theta.pow(2)-log_sigma2_theta.exp(), dim=-1).mean()
+        # KW2013: Section 2.4
+        z = self._reparameterize(mu_theta, log_sigma2_theta)
+        theta = nn.functional.softmax(z, dim=-1)
+        return theta, kld_theta
+
+    def decode(self, theta):
+        # KW2019
+        beta = nn.functional.softmax(self._alphas(self._rho.weight), dim=0).transpose(1, 0)
+        res = torch.mm(theta, beta)
+        pred = torch.log(res+torch.full_like(res, 1e-6))
+        return pred
+
+    def forward(self, bows, normalized=True):
+        # encoding
+        if normalized: 
+            normalized_bows = bows / bows.sum(1, keepdim=True)
+            normalized_bows[normalized_bows!=normalized_bows] = 0
+            theta, kld_theta = self.encode(normalized_bows)
+        else: 
+            theta, kld_theta = self.encode(bows)
+        # decoding
+        pred = self.decode(theta)
+        # compute loss
+        recon_loss = -(pred*bows).sum(1).mean()
+        return recon_loss, kld_theta
+
+    def get_topics(self, w2v, k=10, output=False):
+        alphas = self.alphas.tolist()
+        wx = w2v.weight.tolist()
+        sim = np.argsort(cosine_similarity(alphas, wx))[:, -k:]
+        rep_words = list(map(lambda x: [w2v.inv_vocab[i] for i in x], sim))
+        print('\n'.join([f'  Topic {i+1}: '+', '.join(words) for i, words in enumerate(rep_words)]))
+        if output:
+            return rep_words
+
+    @property
+    def alphas(self):
+        return self._alphas.weight
+
+
+class LDA(object):
+    '''Topic Modeling in Embedding Spaces
+
+    INTERFACE
+    ---------
+    self.train
+      w2v [script.etm.Word2Vec] Word2Vec model
+      train [list] list of docs
+      num_topics [int]
+      
+
+    self.get_topics => top k words for each topic [numpy.array]
+      k [int] top k words chosen from each topic to represent the topic
+      output [bool] return the top k words if true
+    '''
+    def __init__(self):
+        self.model = None
+
+    def train(self, w2v, train, num_topics):
+        corpus = [self._doc2bow(doc, w2v) for doc in train]
+        self.model = LdaModel(corpus=corpus, id2word=w2v.inv_vocab, num_topics=num_topics)
+        
+    def get_topics(self, k=10, output=False):
+        rep_words = [re.findall('"([a-z]+)"', i[1]) for i in self.model.print_topics(k)]
+        print('\n'.join([f'  Topic {i+1}: '+', '.join(words) for i, words in enumerate(rep_words)]))
+        if output:
+            return rep_words
+
+    @staticmethod
+    def _doc2bow(doc, w2v):
+        corpus_whole = zip(range(w2v.V), w2v.corpus2bows([doc]).int().tolist()[0])
+        return list(filter(lambda x: x[1]!=0, corpus_whole))
+
+
+def etm_train(model, w2v, train, test, optimizer, device, batch_size,
+              epoch_nums, model_path, load_model, save_model, 
+              normalized=True, check=True):
+    '''train ETM
+    
+    PARAMETER
+    ---------
+      model [script.etm.ETM] ETM model
+      w2v [script.etm.Word2Vec] Word2Vec model
+      train [list] list of docs
+      test [list] list of docs
+      batch_size [int]
+      optimizer [torch.optim.{optimizer}]
+      device [torch.device]
+      epoch_nums [int] 
+      model_path [str] 
+      load_model [bool] 
+      save_model [int] save the model after {save_model} batches
+    '''
+    # check
+    if check:
+        flag = input('Start[y/n]?')
+        assert flag in ('y', 'n')
+        if flag == 'n': return
+
+    # [SL] model path
+    print('[Init]')
+    if os.path.exists(model_path):
+        print(f'  Model path "{model_path}" exists.')
+    else:
+        os.mkdir(model_path)
+        print(f'  Create {model_path}.')
+        if load_model == True:
+            print(f"  Set load_model to False as the model path doesn't exist")
+            load_model = False
+
+    # [SL] load model
+    if os.path.exists(os.path.join(model_path, 'training_state.pkl')) and load_model:
+        print('  LOAD MODEL: {load_model}')
+        with open(os.path.join(model_path, 'training_state.pkl'), 'rb') as file:
+            training_state = pickle.load(file)
+            epoch_n = training_state['epoch_num']
+        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'rb') as file:
+            train_dataloader = pickle.load(file)
+        checkpoint = torch.load(os.path.join(model_path, f'EP{epoch_n}.torch'))
+        model.load_state_dict(checkpoint['model_state'])
+    # [SL] new model
+    else:
+        training_state = {'epoch_num': 0, 'step_num': 0}
+        train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=True)
+        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
+            pickle.dump(train_dataloader, file)
+
+    length = len(train_dataloader)
+    test_dataloader = DataLoader(test, batch_size=batch_size)
+    model.to(device)
+    t = time.time()
+    for epoch in range(epoch_nums):
+        start = time.time()
+        t0 = start
+        loss_sum = []
+        i = 0
+
+        # [SL] check breakpoint (epoch)
+        if training_state['step_num'] > 0: 
+            training_state['epoch_num'] -= 1
+        epoch_n = training_state['epoch_num'] + epoch + 1
+
+        # [TRAIN & EVAL]
+        model.train()
+        print(f'[Epoch {epoch_n}]')
+        for data in train_dataloader:
+            # [SL] check breakpoint (batch)
+            if i <= training_state['step_num']:
+                i += 1
+                continue
+            else:
+                training_state['step_num'] = 0
+
+            # [TRAIN & EVAL]
+            bows = w2v.corpus2bows(data).to(device)
+            optimizer.zero_grad()
+            recon_loss, kld_theta = model(bows, normalized=normalized)
+            loss = recon_loss + kld_theta
+            loss.backward()
+            loss_sum.append(loss.item())
+            optimizer.step()
+
+            # [SL] save the model regularly (batch)
+            if i % save_model == 0:
+                if i == save_model:
+                    print('\n  checkpoint: ', end='')
+                t1 = time.time() - t0
+                print(f'{i} {int(t1)}s; ', end='' if length-i>=save_model else '\n')
+                t0 = time.time()
+                torch.save({'model_state': model.state_dict()},
+                           os.path.join(model_path, f'EP{epoch_n}.torch'))
+                with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
+                    pickle.dump({'epoch_num': epoch_n, 'step_num': i}, file)  
+            i += 1
+
+        # [TRAIN & EVAL]
+        t1 = time.time() - start
+        print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
+
+        # [SL] save the model regularly (epoch)
+        torch.save({'model_state': model.state_dict()},
+                   os.path.join(model_path, f'EP{epoch_n}.torch'))
+        train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=True)
+        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
+            pickle.dump(train_dataloader, file)
+        with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
+            pickle.dump({'epoch_num': epoch_n, 'step_num': 0}, file)
+
+        # [TRAIN & EVAL]
+        model.eval()
+        loss_sum = []
+        t0 = time.time()
+        with torch.no_grad():
+            for data in test_dataloader:
+                bows = w2v.corpus2bows(data).to(device)
+                recon_loss, kld_theta = model(bows, normalized=normalized)
+                loss = recon_loss + kld_theta
+                loss_sum.append(loss.item())
+
+        t1 = time.time() - t0
+        print(f'  test loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
+    t1 = time.time() - t
+    print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+    print('[Top 10 Words]')
+    model.get_topics(w2v, 10)
+
+
+def lda_train(model, w2v, train, num_topics):
+    '''train LDA
+    
+    model [script.etm.LDA] LDA model
+    w2v [script.etm.Word2Vec] Word2Vec model
+    train [list] list of docs
+    num_topics [int]
+    '''
+    t = time.time()
+    model.train(w2v, train, num_topics)
+    t1 = time.time() - t
+    print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+    print('[Top 10 Words]')
+    model.get_topics(10)
+
+
+def set_random_seed(random_seed):
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    torch.cuda.manual_seed_all(random_seed)
+    
+
+def get_activation(act):
+    if act == 'tanh': 
+        return nn.Tanh()
+    if act == 'relu': 
+        return nn.ReLU()
+    if act == 'softplus': 
+        return nn.Softplus()
+    if act == 'rrelu': 
+        return nn.RReLU()
+    if act == 'leakyrelu':  
+        return nn.LeakyReLU()
+    if act == 'elu': 
+        return nn.ELU()
+    if act == 'selu': 
+        return nn.SELU()
+    if act == 'glu': 
+        return nn.GLU()
+    raise ValueError('Invalid activation function.')
+
+
+def get_optimizer(param, optimizer_name, lr, wdecay=None):
+    if optimizer_name == 'sgd':
+        return optim.SGD(param, lr=lr)
+    assert wdecay is not None
+    if optimizer_name == 'adam':
+        return optim.Adam(param, lr=lr, weight_decay=wdecay)
+    if optimizer_name == 'adagrad':
+        return optim.Adagrad(param, lr=lr, weight_decay=wdecay)
+    if optimizer_name == 'adadelta':
+        return optim.Adadelta(param, lr=lr, weight_decay=wdecay)
+    if optimizer_name == 'rmsprop':
+        return optim.RMSprop(param, lr=lr, weight_decay=wdecay)
+    if optimizer_name == 'asgd':
+        return optim.ASGD(param, lr=lr, weight_decay=wdecay, t0=0, lambd=0.)
+    raise ValueError('Invalid optimizer.')
