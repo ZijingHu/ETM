@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from gensim.models import LdaModel
 from sklearn.metrics.pairwise import cosine_similarity
 
+from .Parameters import Parameters
 
 class ETM(nn.Module):
     '''Topic Modeling in Embedding Spaces
@@ -286,8 +287,8 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
 
         # [TRAIN & EVAL]
         t1 = time.time() - start
-        print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
-
+        print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')  
+        
         # [SL] save the model regularly (epoch)
         torch.save({'model_state': model.state_dict()},
                    os.path.join(model_path, f'model.torch' if epoch_n == epoch_nums else f'EP{epoch_n}.torch'))
@@ -315,18 +316,24 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
         print(f'  test loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
     t1 = time.time() - t
     print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+    beta = model.beta.cpu().detach().numpy()
+    td, tc = evaluation(beta, train, w2v.inv_vocab)
+    print(f'[Evaluation]\n  TD: {td:.4f};\n TC: {tc:.4f};')      
     print('[Top 10 Words]')
     model.get_topics(w2v, 10)
 
 
-def etm_load(model, model_path):
-    model.to('cpu')
+def etm_load(model_path, w2v=None, model_name='model'):
+    params = Parameters(load=model_path)
+    word2vec_model = w2v if params['model']['pretrained_weight'] else None
+    etm = ETM(word2vec_model=word2vec_model, **params['model'])
     if os.path.exists(os.path.join(model_path, 'training_state.pkl')):
-        checkpoint = torch.load(os.path.join(model_path, f'EP{epoch_n}.torch'))
-        model.load_state_dict(checkpoint['model_state'])
+        checkpoint = torch.load(os.path.join(model_path, f'{model_name}.torch'))
+        etm.load_state_dict(checkpoint['model_state'])
         print('Successfully load the model.')
     else:
         print('Invalid model path.')
+    return etm
 
 
 def lda_train(model, w2v, train, num_topics, model_path):
@@ -352,8 +359,7 @@ def lda_train(model, w2v, train, num_topics, model_path):
 def etm_train_new(params, data, w2v, device='GPU'):
     if not os.path.exists(params['training']['model_path']):
         os.mkdir(params['training']['model_path'])
-    params_path = os.path.join(params['training']['model_path'], 'params.yml')
-    params.save(params_path)
+    params.save(params['training']['model_path'])
     set_random_seed(params['seed'])
     word2vec_model = w2v if params['model']['pretrained_weight'] else None
     etm = ETM(word2vec_model=word2vec_model, **params['model'])
@@ -414,5 +420,64 @@ def get_optimizer(param, optimizer_name, lr, wdecay=None):
     if optimizer_name == 'asgd':
         return optim.ASGD(param, lr=lr, weight_decay=wdecay, t0=0, lambd=0.)
     raise ValueError('Invalid optimizer.')
-    
 
+
+def doc_freq(data, wi, wj=None):
+    if wj:
+        n_wj, n_wi_wj = 0, 0
+        for doc in data:
+            if wj in doc:
+                n_wj += 1
+                if wi in doc:
+                    n_wi_wj += 1
+        return n_wj, n_wi_wj
+    else:
+        n_wi = 0
+        for doc in data:
+            if wi in doc:
+                n_wi += 1
+        return n_wi    
+
+
+def topic_coherence(beta, data, vocab, topk=10):
+    # Dieng et al. 2019
+    n = len(data)
+    tc = []
+    num_topics = len(beta)
+    for k in range(num_topics):
+        top_k = list(beta[k].argsort()[-topk:][::-1])
+        tc_k = 0
+        counter = 0
+        for i, word in enumerate(top_k):
+            n_wi = doc_freq(data, vocab[word])
+            j = i + 1
+            tmp = 0
+            while j < len(top_k) and j > i:
+                n_wj, n_wi_wj = doc_freq(data, vocab[word], vocab[top_k[j]])
+                mut_info = (np.log(n_wi)+np.log(n_wj)-2.0*np.log(n)) / (np.log(n_wi_wj)-np.log(n)) if n_wi_wj else 0
+                f_wi_wj = -1 + mut_info
+                tmp += f_wi_wj
+                j += 1
+                counter += 1
+            tc_k += tmp 
+        tc.append(tc_k)
+    tc = np.mean(tc) / counter
+    return tc
+
+
+def topic_diversity(beta, topk=10):
+    # Dieng et al. 2019
+    num_topics = beta.shape[0]
+    list_w = np.zeros((num_topics, topk))
+    for k in range(num_topics):
+        idx = beta[k,:].argsort()[-topk:][::-1]
+        list_w[k,:] = idx
+    n_unique = len(np.unique(list_w))
+    td = n_unique / (topk * num_topics)
+    return td
+
+
+def evaluation(beta, data, vocab, topk=10):
+    td = topic_diversity(beta, topk)
+    tc = topic_coherence(beta, data, vocab, topk)
+    return td, tc
