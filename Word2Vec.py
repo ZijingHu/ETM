@@ -56,7 +56,7 @@ class Word2Vec(object):
         self._pretrained_weight = torch.FloatTensor(weight)
         self._bow_generator = CountVectorizer(vocabulary=key_to_index)
         self._inv_vocab = {v: k for k, v in self._bow_generator.vocabulary.items()}
-        print(f'Vocabulary Size: {self.V}; Embedding Size: {self.E}')
+        print(f'[Word2Vec]\nVocabulary Size: {self.V}\nEmbedding Size: {self.E}')
 
     def corpus2bows(self, corpus):
         bows = torch.FloatTensor(self._bow_generator.transform(corpus).toarray())

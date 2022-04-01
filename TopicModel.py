@@ -36,6 +36,7 @@ class ETM(nn.Module):
       output [bool] return the top k words if true
 
     self.alphas => topic embeddings
+    self.beta => topic embeddings * word embedding
 
     REFERENCE
     ---------
@@ -44,7 +45,7 @@ class ETM(nn.Module):
     An Introduction to Variational Autoencoders  [Kingma and Welling 2019] (KW2019)
     '''
     def __init__(self, V, H, T, E, activation, dropout_rate, 
-                 pretrained_weight=None, rho_grad=True):
+                 pretrained_weight=False, rho_grad=True, word2vec_model=None):
         super(ETM, self).__init__()
         # input => hidden state
         self._q_theta = nn.Sequential(
@@ -71,10 +72,12 @@ class ETM(nn.Module):
 
         # rho & alpha(s)
         self._rho = nn.Linear(E, V, bias=False) # shape of weight matrix: V * E
-        if pretrained_weight is not None:
-            v, e = pretrained_weight.shape
+        if pretrained_weight and word2vec_model is None:
+            raise TypeError('word2vec_model is None.')
+        elif pretrained_weight and word2vec_model is not None:
+            v, e = word2vec_model.weight.shape
             assert (v, e) == (V, E), f'pre-trained weight: expect ({V}, {E}) but get ({v}, {e}).'
-            self._rho.weight = nn.Parameter(pretrained_weight)
+            self._rho.weight = nn.Parameter(word2vec_model.weight)
             self._rho.weight.requires_grad = rho_grad
         else:
             nn.init.xavier_normal_(self._rho.weight)
@@ -139,6 +142,11 @@ class ETM(nn.Module):
     @property
     def alphas(self):
         return self._alphas.weight
+        
+    @property
+    def beta(self):
+        beta = nn.functional.softmax(self._alphas(self._rho.weight), dim=0).transpose(1, 0)
+        return beta
 
 
 class LDA(object):
@@ -282,7 +290,10 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
 
         # [SL] save the model regularly (epoch)
         torch.save({'model_state': model.state_dict()},
-                   os.path.join(model_path, f'EP{epoch_n}.torch'))
+                   os.path.join(model_path, f'model.torch' if epoch_n == epoch_nums else f'EP{epoch_n}.torch'))
+        last_train = os.path.join(model_path, f'EP{epoch_n-1}.torch')
+        if os.path.exists(last_train):
+            os.remove(last_train)
         train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=True)
         with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
             pickle.dump(train_dataloader, file)
@@ -308,7 +319,17 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
     model.get_topics(w2v, 10)
 
 
-def lda_train(model, w2v, train, num_topics):
+def etm_load(model, model_path):
+    model.to('cpu')
+    if os.path.exists(os.path.join(model_path, 'training_state.pkl')):
+        checkpoint = torch.load(os.path.join(model_path, f'EP{epoch_n}.torch'))
+        model.load_state_dict(checkpoint['model_state'])
+        print('Successfully load the model.')
+    else:
+        print('Invalid model path.')
+
+
+def lda_train(model, w2v, train, num_topics, model_path):
     '''train LDA
     
     model [script.etm.LDA] LDA model
@@ -316,12 +337,39 @@ def lda_train(model, w2v, train, num_topics):
     train [list] list of docs
     num_topics [int]
     '''
+    if not os.path.exists(model_path):
+        os.mkdir(model_path)
     t = time.time()
     model.train(w2v, train, num_topics)
+    with open(os.path.join(model_path, 'model.pkl'), 'wb') as file:
+        pickle.dump(model, file)
     t1 = time.time() - t
     print(f'[Summary]\n  Total time spent: {int(t1)}s;')
     print('[Top 10 Words]')
     model.get_topics(10)
+
+
+def etm_train_new(params, data, w2v, device='GPU'):
+    if not os.path.exists(params['training']['model_path']):
+        os.mkdir(params['training']['model_path'])
+    params_path = os.path.join(params['training']['model_path'], 'params.yml')
+    params.save(params_path)
+    set_random_seed(params['seed'])
+    word2vec_model = w2v if params['model']['pretrained_weight'] else None
+    etm = ETM(word2vec_model=word2vec_model, **params['model'])
+    optimizer = get_optimizer(etm.parameters(), **params['potimizer'])
+    device = torch.device('cuda:0') if device=='GPU' else torch.device('cpu')
+    etm_train(etm, w2v, data['train'], data['test'], optimizer, device, **params['training'])
+    return etm
+
+
+def lda_train_new(params, data, w2v):
+    if not os.path.exists(params['training']['model_path']):
+        os.mkdir(params['training']['model_path'])
+    set_random_seed(params['seed'])
+    lda = LDA()
+    lda_train(lda, w2v, data['train'], params['model']['T'], params['training']['model_path'])
+    return lda
 
 
 def set_random_seed(random_seed):
@@ -366,3 +414,5 @@ def get_optimizer(param, optimizer_name, lr, wdecay=None):
     if optimizer_name == 'asgd':
         return optim.ASGD(param, lr=lr, weight_decay=wdecay, t0=0, lambd=0.)
     raise ValueError('Invalid optimizer.')
+    
+
