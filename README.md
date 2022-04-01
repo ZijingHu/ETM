@@ -7,47 +7,56 @@ ETM was originally published by Adji B. Dieng, Francisco J. R. Ruiz, and David M
 ```
 from TopicModel import *
 from Word2Vec import *
+from Parameters import *
 
 w2v_path = './path/GoogleNews-vectors-negative300.bin'
 w2v = Word2Vec(w2v_path, limit=15000, stop_words=True)
 
-seed = 1
-
-model_com_args = {
-    'V': w2v.V,
-    'H': 512,
-    'T': 8,
-    'E': w2v.E,
-    'activation': 'relu',
-    'dropout_rate': 0.2
+data = {
+    'train': ,
+    'test': 
 }
 
-optimizer_com_args = {
-    'optimizer_name': 'adam',
-    'lr': 0.001,
-    'wdecay': 1.2e-6
+default = {
+    'seed': 1,
+    'model': {
+        'V': w2v.V,
+        'H': 512,
+        'T': 8,
+        'E': w2v.E,
+        'activation': 'relu',
+        'dropout_rate': 0.2,
+        'pretrained_weight': False, 
+        'rho_grad': True
+    },
+    'potimizer': {
+        'optimizer_name': 'adam',
+        'lr': 0.002,
+        'wdecay': 1.2e-6
+    },
+    'training': {
+        'batch_size': 256,
+        'epoch_nums': 20,
+        'normalized': True,
+        'check': False,
+        'model_path': 'etm_model',
+        'load_model': False,
+        'save_model': 10000
+    }
 }
 
+params = Parameters(default)
 
-training_com_args = {
-    'batch_size': 512,
-    'epoch_nums': 20,
-    'normalized': True,
-    'check': False,
-    'model_path': 'etm_model',
-    'load_model': False,
-    'save_model': 10000
-}
+# ETM
+T = params['model']['T']
+params['training'].update({'model_path': f'MODEL_ETM_T{T}_W2V_FIXED'})
+params['model'].update({'pretrained_weight': True, 'rho_grad': False})
 
+etm = etm_train_new(params, data, w2v)
 
-train_set = 
-test_set = 
+# LDA
+T = params['model']['T']
+params['training'].update({'model_path': f'MODEL_LDA_T{T}'})
 
-device = torch.device('cuda:0')
-
-set_random_seed(seed)
-etm = ETM(**{**model_com_args, **model_sp_args})
-optimizer = get_optimizer(etm.parameters(), **{**optimizer_com_args, **optimizer_sp_args})
-etm_train(etm, w2v, train_set, test_set, optimizer, device, 
-          **{**training_com_args, **training_sp_args})
+lda = lda_train_new(params, data, w2v)
 ```
