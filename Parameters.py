@@ -2,6 +2,23 @@ import os
 import yaml
 
 class Parameters(object):
+    '''store, save, and load parameters
+    
+    INTERFACE
+    ---------
+    self.__init__
+      params [dict] input params
+      load [str] path to load the params
+      
+    self.save
+      path [str] path to save the params
+      
+    self.load
+      path [str] path to load the params
+      
+    self.update
+      new_dict [dict] partially or completely update params
+    '''
     def __init__(self, params={}, load=None):
         self._params = params
         if load:
