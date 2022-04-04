@@ -254,7 +254,6 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
 
         # [TRAIN & EVAL]
         model.train()
-        print(f'[Epoch {epoch_n}]')
         for data in train_dataloader:
             # [SL] check breakpoint (batch)
             if i <= training_state['step_num']:
@@ -284,10 +283,11 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
                 with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
                     pickle.dump({'epoch_num': epoch_n, 'step_num': i}, file)  
             i += 1
-
-        # [TRAIN & EVAL]
         t1 = time.time() - start
-        print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')  
+        print(f'[Epoch {epoch_n}] {int(t1)}s; Completed...', end='\r')
+        # [TRAIN & EVAL]
+        # t1 = time.time() - start
+        # print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')  
         
         # [SL] save the model regularly (epoch)
         torch.save({'model_state': model.state_dict()},
@@ -302,23 +302,27 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
             pickle.dump({'epoch_num': epoch_n, 'step_num': 0}, file)
 
         # [TRAIN & EVAL]
-        model.eval()
-        loss_sum = []
-        t0 = time.time()
-        with torch.no_grad():
-            for data in test_dataloader:
-                bows = w2v.corpus2bows(data).to(device)
-                recon_loss, kld_theta = model(bows, normalized=normalized)
-                loss = recon_loss + kld_theta
-                loss_sum.append(loss.item())
-
-        t1 = time.time() - t0
-        print(f'  test loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
+        # model.eval()
+        # loss_sum = []
+        # t0 = time.time()
+        # with torch.no_grad():
+        #     for data in test_dataloader:
+        #         bows = w2v.corpus2bows(data).to(device)
+        #         recon_loss, kld_theta = model(bows, normalized=normalized)
+        #         loss = recon_loss + kld_theta
+        #         loss_sum.append(loss.item())
+        # 
+        # t1 = time.time() - t0
+        # print(f'  test loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
+    print()
     t1 = time.time() - t
     print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+    print('[Evaluation]')
     beta = model.beta.cpu().detach().numpy()
     td, tc = evaluation(beta, train, w2v.inv_vocab)
-    print(f'[Evaluation]\n  TD: {td:.4f};\n TC: {tc:.4f};')      
+    print(f'  [Train] TD: {td:.4f}; TC: {tc:.4f};')
+    td, tc = evaluation(beta, test, w2v.inv_vocab)
+    print(f'  [Test] TD: {td:.4f}; TC: {tc:.4f};')
     print('[Top 10 Words]')
     model.get_topics(w2v, 10)
 
