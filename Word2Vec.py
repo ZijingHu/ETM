@@ -1,6 +1,10 @@
 import re
+import scipy
 import spacy
 import torch
+from nltk.corpus import wordnet
+from nltk.stem import WordNetLemmatizer
+from nltk.stem.snowball import SnowballStemmer
 from gensim.parsing.preprocessing import STOPWORDS
 from gensim.models.keyedvectors import KeyedVectors as word2vec
 from sklearn.feature_extraction.text import CountVectorizer
@@ -77,3 +81,26 @@ class Word2Vec(object):
     @property
     def inv_vocab(self):
         return self._inv_vocab
+
+
+def entropy(text):
+    bow = w2v.corpus2bows([text]).numpy()[0]
+    s = bow.sum()
+    return scipy.stats.entropy(bow / s) if s else 0
+    
+
+def stem(sentence):
+    ss, wnl = SnowballStemmer("english"), WordNetLemmatizer()
+    sentence = sentence.lower()  
+    sentence = ' '.join([wnl.lemmatize(word)\
+                         if len(wordnet.synsets(wnl.lemmatize(word)))>0 \
+                           and wordnet.synsets(wnl.lemmatize(word))[0].name().startswith(wnl.lemmatize(word))==True \
+                         else word \
+                         for word in sentence.split(' ')])
+    sentence = ' '.join([ss.stem(word)\
+                         if len(wordnet.synsets(ss.stem(word)))>0 
+                           and wordnet.synsets(ss.stem(word))[0].name().startswith(ss.stem(word))==True \
+                         else word \
+                         for word in sentence.split(' ')])
+    
+    return sentence
