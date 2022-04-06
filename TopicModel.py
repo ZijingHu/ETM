@@ -266,7 +266,9 @@ def etm_train(model, w2v, train, test, optimizer, device, batch_size,
             bows = w2v.corpus2bows(data).to(device)
             optimizer.zero_grad()
             recon_loss, kld_theta = model(bows, normalized=normalized)
-            loss = recon_loss + kld_theta
+            # orthogonal regularization
+            loss_orth = (model.alphas @ model.alphas.T / (model.alphas ** 2).sum(1)).mean()
+            loss = recon_loss + kld_theta + loss_orth
             loss.backward()
             loss_sum.append(loss.item())
             optimizer.step()
