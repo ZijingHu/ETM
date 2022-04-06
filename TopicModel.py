@@ -1,5 +1,6 @@
 import re
 import os
+import copy
 import time
 import torch
 import random
@@ -39,6 +40,18 @@ class ETM(nn.Module):
     self.alphas => topic embeddings
     self.beta => topic embeddings * word embedding
 
+    self.train_model => ETM model
+      w2v [script.etm.Word2Vec] Word2Vec model
+      train_set [list] list of docs
+      test_set [list] list of docs
+      batch_size [int]
+      optimizer [torch.optim.{optimizer}]
+      device [torch.device]
+      epoch_nums [int] 
+      model_path [str] 
+      load_model [bool] 
+      save_model [int] save the model after {save_model} batches
+
     REFERENCE
     ---------
     Topic Modeling in Embedding Spaces [Dieng et al. 2019]
@@ -49,6 +62,7 @@ class ETM(nn.Module):
                  pretrained_weight=False, rho_grad=True, word2vec_model=None):
         super(ETM, self).__init__()
         # input => hidden state
+        word2vec_model = copy.deepcopy(word2vec_model)
         self._q_theta = nn.Sequential(
             nn.Linear(V, H),
             nn.Dropout(dropout_rate),
@@ -133,7 +147,7 @@ class ETM(nn.Module):
 
     def get_topics(self, w2v, k=10, output=False):
         alphas = self.alphas.tolist()
-        wx = w2v.weight.tolist()
+        wx = self._rho.weight.to('cpu').tolist()
         sim = np.argsort(cosine_similarity(alphas, wx))[:, -k:]
         rep_words = list(map(lambda x: [w2v.inv_vocab[i] for i in x], sim))
         print('\n'.join([f'  Topic {i+1}: '+', '.join(words) for i, words in enumerate(rep_words)]))
@@ -149,6 +163,118 @@ class ETM(nn.Module):
         beta = nn.functional.softmax(self._alphas(self._rho.weight), dim=0).transpose(1, 0)
         return beta
 
+    def train_model(self, w2v, train_set, test_set, optimizer, device, batch_size,
+              epoch_nums, model_path, load_model, save_model, 
+              normalized=True, check=True):
+        # check
+        if check:
+            flag = input('Start[y/n]?')
+            assert flag in ('y', 'n')
+            if flag == 'n': return
+
+        # [SL] model path
+        print('[Init]')
+        if os.path.exists(model_path):
+            print(f'  Model path "{model_path}" exists.')
+        else:
+            os.mkdir(model_path)
+            print(f'  Create {model_path}.')
+            if load_model == True:
+                print(f"  Set load_model to False as the model path doesn't exist")
+                load_model = False
+
+        # [SL] load model
+        if os.path.exists(os.path.join(model_path, 'training_state.pkl')) and load_model:
+            print('  LOAD MODEL: {load_model}')
+            with open(os.path.join(model_path, 'training_state.pkl'), 'rb') as file:
+                training_state = pickle.load(file)
+                epoch_n = training_state['epoch_num']
+            with open(os.path.join(model_path, 'train_dataloader.pkl'), 'rb') as file:
+                train_dataloader = pickle.load(file)
+            checkpoint = torch.load(os.path.join(model_path, f'EP{epoch_n}.torch'))
+            self.load_state_dict(checkpoint['model_state'])
+        # [SL] new model
+        else:
+            training_state = {'epoch_num': 0, 'step_num': 0}
+            train_dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+            with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
+                pickle.dump(train_dataloader, file)
+
+        length = len(train_dataloader)
+        test_dataloader = DataLoader(test_set, batch_size=batch_size)
+        self.to(device)
+        t = time.time()
+        for epoch in range(epoch_nums):
+            start = time.time()
+            t0 = start
+            loss_sum = []
+            i = 0
+
+            # [SL] check breakpoint (epoch)
+            if training_state['step_num'] > 0: 
+                training_state['epoch_num'] -= 1
+            epoch_n = training_state['epoch_num'] + epoch + 1
+
+            # [TRAIN & EVAL]
+            self.train()
+            for data in train_dataloader:
+                # [SL] check breakpoint (batch)
+                if i <= training_state['step_num']:
+                    i += 1
+                    continue
+                else:
+                    training_state['step_num'] = 0
+
+                # [TRAIN & EVAL]
+                bows = w2v.corpus2bows(data).to(device)
+                optimizer.zero_grad()
+                recon_loss, kld_theta = self(bows, normalized=normalized)
+                # orthogonal regularization
+                loss_orth = (self.alphas @ self.alphas.T / (self.alphas ** 2).sum(1)).mean()
+                loss = recon_loss + kld_theta + loss_orth
+                loss.backward()
+                loss_sum.append(loss.item())
+                optimizer.step()
+
+                # [SL] save the model regularly (batch)
+                if i % save_model == 0:
+                    if i == save_model:
+                        print('\n  checkpoint: ', end='')
+                    t1 = time.time() - t0
+                    print(f'{i} {int(t1)}s; ', end='' if length-i>=save_model else '\n')
+                    t0 = time.time()
+                    torch.save({'model_state': self.state_dict()},
+                               os.path.join(model_path, f'EP{epoch_n}.torch'))
+                    with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
+                        pickle.dump({'epoch_num': epoch_n, 'step_num': i}, file)  
+                i += 1
+            t1 = time.time() - start
+            print(f'[Epoch {epoch_n}] {int(t1)}s; Completed...', end='\r') 
+            
+            # [SL] save the model regularly (epoch)
+            torch.save({'model_state': self.state_dict()},
+                       os.path.join(model_path, f'model.torch' if epoch_n == epoch_nums else f'EP{epoch_n}.torch'))
+            last_train = os.path.join(model_path, f'EP{epoch_n-1}.torch')
+            if os.path.exists(last_train):
+                os.remove(last_train)
+            train_dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+            with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
+                pickle.dump(train_dataloader, file)
+            with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
+                pickle.dump({'epoch_num': epoch_n, 'step_num': 0}, file)
+
+        print()
+        t1 = time.time() - t
+        print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+        print('[Evaluation]')
+        beta = self.beta.cpu().detach().numpy()
+        td, tc = evaluation(beta, train_set, w2v.inv_vocab)
+        print(f'  [Train] TD: {td:.4f}; TC: {tc:.4f};')
+        td, tc = evaluation(beta, test_set, w2v.inv_vocab)
+        print(f'  [Test] TD: {td:.4f}; TC: {tc:.4f};')
+        print('[Top 10 Words]')
+        self.get_topics(w2v, 10)
+    
 
 class LDA(object):
     '''Topic Modeling in Embedding Spaces
@@ -159,18 +285,18 @@ class LDA(object):
       w2v [script.etm.Word2Vec] Word2Vec model
       train [list] list of docs
       num_topics [int]
-      
-
+    
     self.get_topics => top k words for each topic [numpy.array]
       k [int] top k words chosen from each topic to represent the topic
       output [bool] return the top k words if true
+    
+    self.train_model => LDA model
+      w2v [script.etm.Word2Vec] Word2Vec model
+      train [list] list of docs
+      num_topics [int]
     '''
     def __init__(self):
         self.model = None
-
-    def train(self, w2v, train, num_topics):
-        corpus = [self._doc2bow(doc, w2v) for doc in train]
-        self.model = LdaModel(corpus=corpus, id2word=w2v.inv_vocab, num_topics=num_topics)
         
     def get_topics(self, k=10, output=False):
         rep_words = [re.findall('"([a-z]+)"', i[1]) for i in self.model.print_topics(k)]
@@ -184,149 +310,31 @@ class LDA(object):
         return list(filter(lambda x: x[1]!=0, corpus_whole))
 
 
-def etm_train(model, w2v, train, test, optimizer, device, batch_size,
-              epoch_nums, model_path, load_model, save_model, 
-              normalized=True, check=True):
-    '''train ETM
-    
-    PARAMETER
-    ---------
-      model [script.etm.ETM] ETM model
-      w2v [script.etm.Word2Vec] Word2Vec model
-      train [list] list of docs
-      test [list] list of docs
-      batch_size [int]
-      optimizer [torch.optim.{optimizer}]
-      device [torch.device]
-      epoch_nums [int] 
-      model_path [str] 
-      load_model [bool] 
-      save_model [int] save the model after {save_model} batches
-    '''
-    # check
-    if check:
-        flag = input('Start[y/n]?')
-        assert flag in ('y', 'n')
-        if flag == 'n': return
+    def train_model(self, w2v, train_set, num_topics, model_path):
+        if not os.path.exists(model_path):
+            os.mkdir(model_path)
+        t = time.time()
+        corpus = [self._doc2bow(doc, w2v) for doc in train_set]
+        self.model = LdaModel(corpus=corpus, id2word=w2v.inv_vocab, num_topics=num_topics)
+        with open(os.path.join(model_path, 'model.pkl'), 'wb') as file:
+            pickle.dump(self.model, file)
+        t1 = time.time() - t
+        print(f'[Summary]\n  Total time spent: {int(t1)}s;')
+        print('[Top 10 Words]')
+        self.get_topics(10)        
 
-    # [SL] model path
-    print('[Init]')
-    if os.path.exists(model_path):
-        print(f'  Model path "{model_path}" exists.')
-    else:
-        os.mkdir(model_path)
-        print(f'  Create {model_path}.')
-        if load_model == True:
-            print(f"  Set load_model to False as the model path doesn't exist")
-            load_model = False
 
-    # [SL] load model
-    if os.path.exists(os.path.join(model_path, 'training_state.pkl')) and load_model:
-        print('  LOAD MODEL: {load_model}')
-        with open(os.path.join(model_path, 'training_state.pkl'), 'rb') as file:
-            training_state = pickle.load(file)
-            epoch_n = training_state['epoch_num']
-        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'rb') as file:
-            train_dataloader = pickle.load(file)
-        checkpoint = torch.load(os.path.join(model_path, f'EP{epoch_n}.torch'))
-        model.load_state_dict(checkpoint['model_state'])
-    # [SL] new model
-    else:
-        training_state = {'epoch_num': 0, 'step_num': 0}
-        train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=True)
-        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
-            pickle.dump(train_dataloader, file)
-
-    length = len(train_dataloader)
-    test_dataloader = DataLoader(test, batch_size=batch_size)
-    model.to(device)
-    t = time.time()
-    for epoch in range(epoch_nums):
-        start = time.time()
-        t0 = start
-        loss_sum = []
-        i = 0
-
-        # [SL] check breakpoint (epoch)
-        if training_state['step_num'] > 0: 
-            training_state['epoch_num'] -= 1
-        epoch_n = training_state['epoch_num'] + epoch + 1
-
-        # [TRAIN & EVAL]
-        model.train()
-        for data in train_dataloader:
-            # [SL] check breakpoint (batch)
-            if i <= training_state['step_num']:
-                i += 1
-                continue
-            else:
-                training_state['step_num'] = 0
-
-            # [TRAIN & EVAL]
-            bows = w2v.corpus2bows(data).to(device)
-            optimizer.zero_grad()
-            recon_loss, kld_theta = model(bows, normalized=normalized)
-            # orthogonal regularization
-            loss_orth = (model.alphas @ model.alphas.T / (model.alphas ** 2).sum(1)).mean()
-            loss = recon_loss + kld_theta + loss_orth
-            loss.backward()
-            loss_sum.append(loss.item())
-            optimizer.step()
-
-            # [SL] save the model regularly (batch)
-            if i % save_model == 0:
-                if i == save_model:
-                    print('\n  checkpoint: ', end='')
-                t1 = time.time() - t0
-                print(f'{i} {int(t1)}s; ', end='' if length-i>=save_model else '\n')
-                t0 = time.time()
-                torch.save({'model_state': model.state_dict()},
-                           os.path.join(model_path, f'EP{epoch_n}.torch'))
-                with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
-                    pickle.dump({'epoch_num': epoch_n, 'step_num': i}, file)  
-            i += 1
-        t1 = time.time() - start
-        print(f'[Epoch {epoch_n}] {int(t1)}s; Completed...', end='\r')
-        # [TRAIN & EVAL]
-        # t1 = time.time() - start
-        # print(f'  train loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')  
-        
-        # [SL] save the model regularly (epoch)
-        torch.save({'model_state': model.state_dict()},
-                   os.path.join(model_path, f'model.torch' if epoch_n == epoch_nums else f'EP{epoch_n}.torch'))
-        last_train = os.path.join(model_path, f'EP{epoch_n-1}.torch')
-        if os.path.exists(last_train):
-            os.remove(last_train)
-        train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=True)
-        with open(os.path.join(model_path, 'train_dataloader.pkl'), 'wb') as file:
-            pickle.dump(train_dataloader, file)
-        with open(os.path.join(model_path, 'training_state.pkl'), 'wb') as file:
-            pickle.dump({'epoch_num': epoch_n, 'step_num': 0}, file)
-
-        # [TRAIN & EVAL]
-        # model.eval()
-        # loss_sum = []
-        # t0 = time.time()
-        # with torch.no_grad():
-        #     for data in test_dataloader:
-        #         bows = w2v.corpus2bows(data).to(device)
-        #         recon_loss, kld_theta = model(bows, normalized=normalized)
-        #         loss = recon_loss + kld_theta
-        #         loss_sum.append(loss.item())
-        # 
-        # t1 = time.time() - t0
-        # print(f'  test loss: {np.mean(loss_sum):.4f}; time: {int(t1)}s;')
-    print()
-    t1 = time.time() - t
-    print(f'[Summary]\n  Total time spent: {int(t1)}s;')
-    print('[Evaluation]')
-    beta = model.beta.cpu().detach().numpy()
-    td, tc = evaluation(beta, train, w2v.inv_vocab)
-    print(f'  [Train] TD: {td:.4f}; TC: {tc:.4f};')
-    td, tc = evaluation(beta, test, w2v.inv_vocab)
-    print(f'  [Test] TD: {td:.4f}; TC: {tc:.4f};')
-    print('[Top 10 Words]')
-    model.get_topics(w2v, 10)
+def etm_train_new(params, data, w2v, device='GPU'):
+    if not os.path.exists(params['training']['model_path']):
+        os.mkdir(params['training']['model_path'])
+    params.save(params['training']['model_path'])
+    set_random_seed(params['seed'])
+    word2vec_model = w2v if params['model']['pretrained_weight'] else None
+    etm = ETM(word2vec_model=word2vec_model, **params['model'])
+    optimizer = get_optimizer(etm.parameters(), **params['potimizer'])
+    device_ = torch.device('cuda:0') if device=='GPU' else torch.device('cpu')
+    etm.train_model(w2v, data['train'], data['test'], optimizer, device_, **params['training'])
+    return etm
 
 
 def etm_load(model_path, w2v=None, model_name='model'):
@@ -342,45 +350,12 @@ def etm_load(model_path, w2v=None, model_name='model'):
     return etm
 
 
-def lda_train(model, w2v, train, num_topics, model_path):
-    '''train LDA
-    
-    model [script.etm.LDA] LDA model
-    w2v [script.etm.Word2Vec] Word2Vec model
-    train [list] list of docs
-    num_topics [int]
-    '''
-    if not os.path.exists(model_path):
-        os.mkdir(model_path)
-    t = time.time()
-    model.train(w2v, train, num_topics)
-    with open(os.path.join(model_path, 'model.pkl'), 'wb') as file:
-        pickle.dump(model, file)
-    t1 = time.time() - t
-    print(f'[Summary]\n  Total time spent: {int(t1)}s;')
-    print('[Top 10 Words]')
-    model.get_topics(10)
-
-
-def etm_train_new(params, data, w2v, device='GPU'):
-    if not os.path.exists(params['training']['model_path']):
-        os.mkdir(params['training']['model_path'])
-    params.save(params['training']['model_path'])
-    set_random_seed(params['seed'])
-    word2vec_model = w2v if params['model']['pretrained_weight'] else None
-    etm = ETM(word2vec_model=word2vec_model, **params['model'])
-    optimizer = get_optimizer(etm.parameters(), **params['potimizer'])
-    device = torch.device('cuda:0') if device=='GPU' else torch.device('cpu')
-    etm_train(etm, w2v, data['train'], data['test'], optimizer, device, **params['training'])
-    return etm
-
-
 def lda_train_new(params, data, w2v):
     if not os.path.exists(params['training']['model_path']):
         os.mkdir(params['training']['model_path'])
     set_random_seed(params['seed'])
     lda = LDA()
-    lda_train(lda, w2v, data['train'], params['model']['T'], params['training']['model_path'])
+    lda.train_model(w2v, data['train'], params['model']['T'], params['training']['model_path'])
     return lda
 
 
