@@ -2,9 +2,9 @@ import re
 import scipy
 import spacy
 import torch
-from nltk.corpus import wordnet
+import string
 from nltk.stem import WordNetLemmatizer
-from nltk.stem.snowball import SnowballStemmer
+from nltk.corpus import brown, nps_chat, conll2000
 from gensim.parsing.preprocessing import STOPWORDS
 from gensim.models.keyedvectors import KeyedVectors as word2vec
 from sklearn.feature_extraction.text import CountVectorizer
@@ -36,17 +36,24 @@ class Word2Vec(object):
     '''
     def __init__(self, path, limit, stop_words=False, binary=True):
         if stop_words:
+            model = word2vec.load_word2vec_format(path, binary=binary, limit=int(limit*5))
+            stem_vocab = set([stem(i) for i in model.index_to_key])
             # built-in stop word list
             sklearn_stopwords = CountVectorizer(stop_words='english').get_stop_words()
             gesim_stopwords = STOPWORDS
             spacy_stopwords = spacy.load('en_core_web_sm').Defaults.stop_words
+            nltk_interjection = set([word.lower() for (word, tag) in brown.tagged_words() if tag.startswith('UH')] + 
+                                    [word.lower() for (word, tag) in nps_chat.tagged_words() \
+                                      if tag.startswith('UH') and not re.search(r"[0-9#$%^&*()_+<>:=/\\\[\]']", word)] +
+                                    [word.lower() for (word, tag) in conll2000.tagged_words() if tag.startswith('UH')])
             # stop words & meaningless special characters
-            word_filter = lambda x: not (x.lower() in sklearn_stopwords or \
-                                         x.lower() in gesim_stopwords or \
-                                         x.lower() in spacy_stopwords or \
-                                         re.search(r"[0-9#$%^&*()_+<>']", x.lower()) or \
-                                         len(x) <= 2)
-            model = word2vec.load_word2vec_format(path, binary=binary, limit=int(limit*1.5))
+            word_filter = lambda x: (x in stem_vocab) and \
+                                    (not (x.lower() in sklearn_stopwords or \
+                                          x.lower() in gesim_stopwords or \
+                                          x.lower() in spacy_stopwords or \
+                                          x.lower() in nltk_interjection or \
+                                          re.search(r"[0-9#$%^&*()_+<>']", x.lower()) or \
+                                          len(x) <= 2))
             keys = list(filter(word_filter, model.index_to_key))
             limit = model.key_to_index[keys[limit]] # update limit
             model = word2vec.load_word2vec_format(path, binary=binary, limit=limit)
@@ -83,24 +90,20 @@ class Word2Vec(object):
         return self._inv_vocab
 
 
-def entropy(text):
+def entropy(text, w2v):
     bow = w2v.corpus2bows([text]).numpy()[0]
     s = bow.sum()
     return scipy.stats.entropy(bow / s) if s else 0
     
 
-def stem(sentence):
-    ss, wnl = SnowballStemmer("english"), WordNetLemmatizer()
-    sentence = sentence.lower()  
-    sentence = ' '.join([wnl.lemmatize(word)\
-                         if len(wordnet.synsets(wnl.lemmatize(word)))>0 \
-                           and wordnet.synsets(wnl.lemmatize(word))[0].name().startswith(wnl.lemmatize(word))==True \
-                         else word \
-                         for word in sentence.split(' ')])
-    sentence = ' '.join([ss.stem(word)\
-                         if len(wordnet.synsets(ss.stem(word)))>0 
-                           and wordnet.synsets(ss.stem(word))[0].name().startswith(ss.stem(word))==True \
-                         else word \
-                         for word in sentence.split(' ')])
-    
-    return sentence
+def stem_(word):
+    word_s = WNL.lemmatize(word, 'v')
+    if word == word_s:
+        word_s = WNL.lemmatize(word, 'n')
+    word = word_s
+    return word_s
+
+WNL = WordNetLemmatizer()
+def stem(text):
+    text = text.lower().translate(str.maketrans('', '', string.punctuation))
+    return ' '.join([stem_(word) for word in text.split(' ')])
